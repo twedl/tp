@@ -78,9 +78,17 @@ Thin wrapper around the `microtrade` Python library. Runs as a Kubernetes
 All heavy lifting (parsing workbooks, reading raw files, writing parquet) is
 done by `microtrade`. This project is planning, dispatch, and state tracking.
 
+**Raw drop semantics (microtrade's model):** each raw file is a YTD snapshot
+for its `(trade_type, year)`. A single `..._202406N.TXT.zip` file covers
+Jan–Jun of 2024; microtrade partitions rows internally via each sheet's
+`routing_column` (a row-level Date). One raw file therefore produces many
+month partitions, and the latest snapshot per `(trade_type, year)` wins at
+ingest time. The unit of reprocessing in this project is
+`(trade_type, year)`, not a single month.
+
 ## Stack
 
-- Python 3.11+
+- Python 3.12+ (microtrade requires `>=3.12`)
 - `loguru` for logging
 - `pydantic-settings` for project config (env + `.env`)
 - `pydantic` v2 for validating `microtrade.yaml`
@@ -133,7 +141,9 @@ raw_dir: directory of raw zipped data files (stage 2 input)
 specs_dir: directory where microtrade writes generated spec YAMLs
 processed_dir: directory for hive-partitioned parquet output
 spec_manifests_dir: state dir for stage 1
-partition_manifests_dir: state dir for stage 2
+raw_manifests_dir: state dir for stage 2 (one JSON per raw file)
+upstream_raw_dir: remote source (provider drops here, periodically deletes)
+raw_remote_dir: our permanent archive (mirror of upstream + version history)
 ```
 
 ## State tracking
@@ -149,7 +159,7 @@ Write atomically: write to `path.tmp`, then `os.replace(tmp, path)`.
 ```
 data/manifests/
   specs/        # one JSON per workbook file
-  partitions/   # one JSON per raw file
+  raw/          # one JSON per raw file
 ```
 
 ### Spec manifest (stage 1) fields
@@ -160,15 +170,18 @@ data/manifests/
 - `specs_written` (list of output spec file paths)
 - `processed_at` (ISO-8601 UTC)
 
-### Partition manifest (stage 2) fields
+### Raw manifest (stage 2) fields
 
 - `raw_name`
 - `raw_hash` (content hash of the raw zip)
 - `microtrade_hash` (content hash of `microtrade.yaml` at time of ingest)
-- `workbook_id`, `sheet_name`, `trade_type`, `year`, `month`, `flag`
-- `partition_dir` (the hive partition this raw file contributed to)
-- `rows_written` (partition-level total)
-- `processed_at`
+- `trade_type`, `year`, `month`, `flag` (extracted from filename via
+  `filename_pattern` — `month` is the snapshot month, not a partition key)
+- `processed_at` (ISO-8601 UTC)
+
+Rows written, per-partition paths, and per-row quality issues are owned by
+microtrade's own manifest under `processed_dir/_manifests/<trade_type>/`.
+This project does not duplicate them.
 
 ## Planning (dirty-check) logic
 
@@ -179,32 +192,37 @@ A workbook is dirty if:
 - `workbook_hash` differs from current file hash, OR
 - `microtrade_hash` differs from current `microtrade.yaml` hash.
 
-### Stage 2 — partition ingest
+### Stage 2 — year ingest
 
 A raw file is dirty if:
 - no manifest exists, OR
 - `raw_hash` differs from current file hash, OR
 - `microtrade_hash` differs from current `microtrade.yaml` hash.
 
-If any raw file mapping to a given partition is dirty, the whole partition
-is dirty. Grouping key: `(trade_type, year, month)`.
+If any raw file mapping to a given `(trade_type, year)` is dirty, the whole
+year is dirty for that trade type. Grouping key: `(trade_type, year)`.
+Rationale: microtrade reprocesses at year granularity (one YTD snapshot
+drives Jan..snapshot-month); there is no "single month" unit to reprocess.
 
-## Partition reprocessing model
+## Year reprocessing model
 
 Output layout is hive-partitioned:
 `<trade_type>/year=YYYY/month=MM/part-N.parquet`
 
-Multiple raw files contribute to one partition. When any raw file for a
-partition is dirty:
+When `(trade_type=T, year=Y)` is dirty:
 
-1. Delete all files in the partition directory.
-2. Re-ingest **every** raw file that maps to that partition (not just the
-   dirty ones) by calling microtrade once with the full list.
-3. Update the manifest for every raw file that contributed.
+1. Call `microtrade.pipeline.run(PipelineConfig(input_dir=raw_dir,
+   output_dir=processed_dir, spec_dir=specs_dir, trade_types=(T,), year=Y,
+   ytd=False))`.
+2. Microtrade handles discovery, latest-snapshot-per-year selection,
+   partition atomicity (`.tmp` + rename), and delete-before-rewrite
+   internally. This project does not touch `processed_dir` directly.
+3. On success, write raw manifests for every raw file that maps to
+   `(T, Y)`. On failure (non-zero `failed_count` in `RunSummary`), skip
+   manifest updates so the year replans next run.
 
-Rationale: simpler than per-row provenance tracking; guarantees partition
-correctness; self-healing on partial failure (no manifest update → replanned
-next run).
+Self-healing on partial failure: failed years have no manifest updates and
+replan automatically.
 
 ## Matching raw files to partitions
 
@@ -229,12 +247,13 @@ methods:
 class MicrotradeAdapter:
     def import_spec(self, workbook: Path, microtrade_yaml: Path,
                     specs_out: Path) -> list[Path]: ...
-    def ingest(self, raw_files: list[Path], specs_dir: Path,
-               out_dir: Path) -> int: ...
+    def ingest_year(self, trade_type: str, year: int, raw_dir: Path,
+                    specs_dir: Path, out_dir: Path) -> RunSummary: ...
 ```
 
-`import_spec` returns paths of written spec files. `ingest` returns rows
-written. Keep microtrade imports inside this module only.
+`import_spec` returns paths of written spec YAMLs. `ingest_year` returns
+microtrade's `RunSummary` so callers can inspect `failed_count`. Keep
+microtrade imports inside this module only.
 
 ## Pipeline entry point
 
@@ -243,10 +262,9 @@ written. Keep microtrade imports inside this module only.
 1. Loads `config.yaml` via pydantic-settings.
 2. Plans stage 1 (dirty workbooks). Runs stage 1 if any.
 3. Loads `microtrade.yaml` into pydantic models.
-4. Plans stage 2 (dirty partitions). Runs stage 2 if any.
-5. On per-partition failure: log with `logger.exception` and continue with
-   other partitions. Failed partition has no manifest update, so it replans
-   next run.
+4. Plans stage 2 (dirty `(trade_type, year)` pairs). Runs stage 2 if any.
+5. On per-year failure: log with `logger.exception` and continue with other
+   years. Failed year has no raw-manifest updates, so it replans next run.
 
 ## Kubernetes deployment notes
 
@@ -258,7 +276,7 @@ written. Keep microtrade imports inside this module only.
 - Set `concurrencyPolicy: Forbid` on the CronJob so two runs can't race on
   the same state directory.
 - Pod exit code: 0 on clean completion (including "nothing to do"), non-zero
-  if any partition failed. The CronJob's failure metrics then reflect real
+  if any year failed. The CronJob's failure metrics then reflect real
   failures.
 
 ## Module layout
@@ -285,7 +303,7 @@ project/
     processed/
     manifests/
       specs/
-      partitions/
+      raw/
 ```
 
 ## Things this project explicitly does NOT do
@@ -296,5 +314,7 @@ project/
 - No structured/JSON logging.
 - No parsing of raw data files (microtrade does it).
 - No schema validation of parquet output (microtrade's concern).
+- No row-level routing or YTD logic (microtrade owns both).
 - No retry logic beyond "next cronjob run replans dirty items".
-- No per-row provenance tracking; partition is the unit of reprocessing.
+- No per-row provenance tracking; `(trade_type, year)` is the unit of
+  reprocessing.
